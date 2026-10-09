@@ -1,0 +1,83 @@
+"""Task 1: Warp divergence microbenchmark."""
+import time
+import numpy as np
+from numba import cuda
+
+N = 2 ** 20
+ITERS = 1000
+THREADS = 256
+
+
+@cuda.jit
+def kernel_uniform(y, n):
+    idx = cuda.grid(1)
+    if idx < n:
+        v = y[idx]
+        for _ in range(ITERS):
+            v = v * 1.0001 + 0.0001
+        y[idx] = v
+
+
+@cuda.jit
+def kernel_divergent(y, n):
+    idx = cuda.grid(1)
+    if idx < n:
+        v = y[idx]
+        if idx % 2 == 0:
+            for _ in range(ITERS):
+                v = v * 1.0001 + 0.0001
+        else:
+            for _ in range(ITERS):
+                v = (v - 0.0001) / 1.0001
+        y[idx] = v
+
+
+@cuda.jit
+def kernel_warp_aligned(y, n):
+    idx = cuda.grid(1)
+    if idx < n:
+        v = y[idx]
+        warp_id = idx // 32
+        if warp_id % 2 == 0:
+            for _ in range(ITERS):
+                v = v * 1.0001 + 0.0001
+        else:
+            for _ in range(ITERS):
+                v = (v - 0.0001) / 1.0001
+        y[idx] = v
+
+
+def bench(kernel, d_y, blocks, trials=10):
+    # warm-up launch (also triggers JIT compilation)
+    kernel[blocks, THREADS](d_y, N)
+    cuda.synchronize()
+    times = []
+    for _ in range(trials):
+        cuda.synchronize()
+        t0 = time.perf_counter()
+        kernel[blocks, THREADS](d_y, N)
+        cuda.synchronize()
+        times.append(time.perf_counter() - t0)
+    return float(np.mean(times)) * 1000.0  # ms
+
+
+def main():
+    h_y = np.ones(N, dtype=np.float32)
+    d_y = cuda.to_device(h_y)
+    blocks = (N + THREADS - 1) // THREADS
+
+    results = {}
+    for name, k in [("Kernel A (Uniform)", kernel_uniform),
+                    ("Kernel B (Interleaved divergence)", kernel_divergent),
+                    ("Kernel C (Warp-aligned)", kernel_warp_aligned)]:
+        d_y.copy_to_device(h_y)  # reset data; excluded from timing
+        results[name] = bench(k, d_y, blocks)
+
+    base = results["Kernel A (Uniform)"]
+    print(f"{'Kernel':40s} {'Avg time (ms)':>15s} {'Slowdown vs A':>15s}")
+    for name, t in results.items():
+        print(f"{name:40s} {t:15.4f} {t / base:14.2f}x")
+
+
+if __name__ == "__main__":
+    main()
